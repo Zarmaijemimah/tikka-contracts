@@ -1,0 +1,400 @@
+# Oracle Service Runbook
+
+Operational guide for the Tikka randomness oracle service.
+
+## First-Run Setup
+
+The oracle service is deployed via `docker-compose.yml` from the repository root. Before starting, prepare your environment:
+
+### 1. Create environment file
+
+Copy `.env.example` to `.env` and populate with your production credentials:
+
+```bash
+cp .env.example .env
+# Edit .env with:
+# - ORACLE_SECRET_KEY: Ed25519 secret key (S... format or 32-byte hex/base64)
+# - STELLAR_RPC_URL: Soroban RPC endpoint
+# - FACTORY_CONTRACT_ID: Raffle factory contract address
+# - Optional: ALERT_WEBHOOK_URL for operational alerts
+```
+
+### 2. Start the service
+
+```bash
+docker-compose up -d
+```
+
+Docker Compose will:
+
+- Build the oracle service from `oracle/Dockerfile`
+- Mount a persistent volume at `/usr/src/app/data` for checkpoint and dedup state
+- Publish `/health` on host loopback at port 9090 for local probes
+- Keep `/metrics` on a separate, un-published container port (9091 by default)
+- Apply resource limits (512 MB memory, 1 CPU) to prevent runaway consumption
+- Rotate logs to prevent unbounded growth
+
+### 3. Verify startup
+
+```bash
+# Check service is running
+docker-compose ps
+
+# View logs
+docker-compose logs -f oracle
+
+# Check health endpoint (returns {"status":"ok"})
+curl http://localhost:9090/health
+
+# View metrics (Prometheus text format)
+curl http://localhost:9090/metrics
+```
+
+### 4. Local development
+
+For development, copy `docker-compose.override.yml.example` to `docker-compose.override.yml`:
+
+```bash
+cp docker-compose.override.yml.example docker-compose.override.yml
+```
+
+This disables production resource limits and enables debug logging without modifying the committed compose file.
+
+## Data Persistence
+
+The oracle service maintains two critical files in the `/data` volume:
+
+### checkpoint.json
+
+**Purpose:** Tracks the last successfully processed ledger number  
+**Size:** ~100 bytes  
+**Persistence:** Must survive container restarts to avoid event gaps  
+**Loss impact:** If lost, the oracle resumes from the current ledger and misses any `RandomnessRequested` events that occurred while it was down. Fallback: the raffle will timeout on-chain after `ORACLE_TIMEOUT_LEDGERS` and use internal PRNG.
+
+### dedup.json
+
+**Purpose:** Prevents duplicate submission of randomness seeds  
+**Size:** Grows with the number of unique (raffle, request_id) pairs processed  
+**Persistence:** Must survive container restarts to prevent double-submissions  
+**Loss impact:** If lost, requests that were successfully submitted on-chain may be re-submitted after restart, causing `RandomnessAlreadyProvided` errors on-chain.
+
+### Volume mount configuration
+
+The `docker-compose.yml` mounts a named volume `oracle_data` at `/app/data`:
+
+```yaml
+volumes:
+  oracle_data:
+    driver: local
+```
+
+This path matches the container's `WORKDIR /app` and is pre-created with `node`-user ownership in the Dockerfile (`RUN mkdir -p /app/data && chown node:node /app/data`), so the service can write state files without root privileges.
+
+To change the location, set `DATA_DIR` in your `.env` file to the desired absolute or relative path and update the volume mount target in `docker-compose.yml` to match. For Kubernetes deployments, mount a persistent volume claim at the same path.
+
+## Health and Metrics Endpoints
+
+| Endpoint       | Purpose                                                                                                             |
+| -------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `GET /health`  | Liveness probe — returns `{"status":"ok"}`                                                                          |
+| `GET /metrics` | Prometheus text exposition format; requires `Authorization: Bearer <token>` when `METRICS_AUTH_TOKEN` is configured |
+
+Health defaults to port `9090` (`HEALTH_PORT`). Metrics default to port `9091`
+(`METRICS_PORT`) and bind to `127.0.0.1` (`METRICS_BIND_ADDRESS`). Compose does
+not publish the metrics port to the host. To scrape from another container,
+bind metrics to `0.0.0.0`, configure a strong `METRICS_AUTH_TOKEN`, and connect
+to `oracle:9091` on the Compose network. Configuration rejects a non-loopback
+metrics bind without a token.
+
+The health endpoint is published only on host loopback as
+`http://localhost:9090`; Docker's health check continues to call it inside the
+container.
+
+## Metrics Reference
+
+| Metric                            | Type      | Labels    | Description                                                       |
+| --------------------------------- | --------- | --------- | ----------------------------------------------------------------- |
+| `oracle_requests_observed_total`  | Counter   | `raffle`  | `RandomnessRequested` events enqueued for this oracle             |
+| `oracle_request_latency_seconds`  | Histogram | —         | Wall time from event observation to confirmed on-chain submission |
+| `oracle_submissions_total`        | Counter   | `outcome` | Submission results: `success`, `retry`, or `fatal`                |
+| `oracle_queue_depth`              | Gauge     | —         | Current number of pending randomness jobs                         |
+| `oracle_queue_oldest_age_seconds` | Gauge     | —         | Age of the oldest queued job in seconds                           |
+| `oracle_dead_letter_total`        | Counter   | —         | Jobs permanently failed after exhausting retries                  |
+| `oracle_listener_ledger_lag`      | Gauge     | —         | Ledgers between network tip and last processed checkpoint         |
+| `oracle_rpc_errors_total`         | Counter   | `kind`    | RPC errors by phase: `poll`, `simulate`, `send`                   |
+| `oracle_fees_spent_stroops_total` | Counter   | —         | Cumulative transaction fees paid for submissions                  |
+
+## Suggested Alert Rules
+
+These mirror the thresholds in `.env.example` and the existing webhook alerter.
+
+### Queue depth
+
+```yaml
+- alert: OracleQueueDepthHigh
+  expr: oracle_queue_depth > 10
+  for: 2m
+  labels:
+    severity: warning
+  annotations:
+    summary: Oracle request queue depth exceeds limit
+```
+
+Env: `ALERT_QUEUE_DEPTH_LIMIT=10`
+
+### Queue age
+
+```yaml
+- alert: OracleQueueAgeHigh
+  expr: oracle_queue_oldest_age_seconds > 300
+  for: 1m
+  labels:
+    severity: warning
+  annotations:
+    summary: Oldest queued randomness request is stale
+```
+
+Env: `ALERT_QUEUE_AGE_LIMIT_MS=300000` (300 seconds)
+
+### RPC unreachable
+
+```yaml
+- alert: OracleRpcUnreachable
+  expr: increase(oracle_rpc_errors_total{kind="poll"}[5m]) >= 3
+  for: 1m
+  labels:
+    severity: critical
+  annotations:
+    summary: Oracle cannot reach Soroban RPC
+```
+
+Env: `ALERT_RPC_UNREACHABLE_THRESHOLD=3`
+
+### Submission failures
+
+```yaml
+- alert: OracleSubmissionFailures
+  expr: increase(oracle_submissions_total{outcome="fatal"}[10m]) > 0
+  for: 0m
+  labels:
+    severity: critical
+  annotations:
+    summary: Oracle failed to submit provide_randomness
+```
+
+Env: `ALERT_FAILURE_THRESHOLD=3` (consecutive failures before webhook alert)
+
+### Listener lag
+
+```yaml
+- alert: OracleListenerLag
+  expr: oracle_listener_ledger_lag > 50
+  for: 5m
+  labels:
+    severity: warning
+  annotations:
+    summary: Oracle event listener is falling behind chain tip
+```
+
+### Fee burn rate
+
+```yaml
+- alert: OracleFeeBurnHigh
+  expr: rate(oracle_fees_spent_stroops_total[1h]) > 1000000
+  for: 15m
+  labels:
+    severity: info
+  annotations:
+    summary: Oracle transaction fee spend rate is elevated
+```
+
+## Crash-safety and Deduplication
+
+### Failure windows
+
+1. Crash before checkpointing ledger: events may be re-processed after restart; deduplication must prevent double-submission.
+2. Crash after submission but before persisting dedup record: submission may succeed on-chain but the off-chain store not reflect it (risk of duplicate submission after restart).
+3. Crash between enqueue and submission: a job may be lost if it was only in-memory and not checkpointed.
+
+### Current design
+
+- `ledger-checkpoint` persists the last processed ledger to `data/checkpoint.json`.
+- `DeduplicationStore` persists seen requests to `data/dedup.json` and provides duplicate detection.
+- The service marks a request as seen after successful submission to avoid false-positive filtering.
+
+### Tradeoffs and mitigation
+
+- Marking deduplication _after_ successful submission avoids lost requests, but introduces a tiny window where a crash after on-chain success but before persistence could lead to duplicate submission.
+- The dedup store is written synchronously to disk on each check.
+- The ledger checkpoint ensures we don't skip events silently.
+
+## Log schema
+
+The oracle emits structured JSON logs (via `pino`). In development, logs are formatted with `pino-pretty` for readability.
+
+### Common fields
+
+| Field      | Type   | Description                                  |
+| ---------- | ------ | -------------------------------------------- |
+| `level`    | number | Pino log level (10=debug, 30=warn, 50=error) |
+| `msg`      | string | Human-readable log message                   |
+| `time`     | string | ISO-8601 timestamp                           |
+| `pid`      | number | Process ID                                   |
+| `hostname` | string | Machine hostname                             |
+
+### Request-correlation fields
+
+When processing a randomness request, logs are emitted from a child logger bound with:
+
+| Field       | Description                                                      |
+| ----------- | ---------------------------------------------------------------- |
+| `requestId` | BigInt string of the on-chain `RandomnessRequested` `request_id` |
+| `raffleId`  | Soroban contract ID of the raffle                                |
+
+These fields allow you to `grep` a single `requestId` across listener → queue → VRF → submission.
+
+### Example log lines
+
+**Production (JSON):**
+
+```json
+{"level":30,"time":"2026-08-29T08:00:00.000Z","pid":1234,"hostname":"oracle-1","msg":"Enqueuing randomness request","requestId":"42","raffleContract":"CABC...","timestamp":"1234567890"}
+{"level":30,"time":"2026-08-29T08:00:01.000Z","pid":1234,"hostname":"oracle-1","requestId":"42","raffleId":"CABC...","msg":"Successfully submitted provide_randomness: abc123..."}
+```
+
+**Development (pretty):**
+
+```
+[2026-08-29 08:00:00.000 +0000] WARN: Enqueuing randomness request requestId=42 raffleId=CABC...
+[2026-08-29 08:00:01.000 +0000] WARN: Successfully submitted provide_randomness: abc123... requestId=42 raffleId=CABC...
+```
+
+### Secrets redaction
+
+The logger redacts the following from any log message:
+
+- `ORACLE_SECRET_KEY`, `secretKey`, `secret`, `password`, `token`, `apiKey`, `api_key`, `accessKey`, `access_key`, `privateKey`, `private_key`, `passphrase`
+- Hex/base64 strings longer than 32 characters when preceded by `hex=` or `base64=`
+
+Raw key material is **never** written to logs.
+
+## Startup
+
+### Prerequisites
+
+The oracle service requires the following environment variables:
+
+- `ORACLE_SECRET_KEY`: Stellar Ed25519 secret key (S... format or 32-byte hex/base64)
+- `STELLAR_RPC_URL`: Soroban RPC endpoint (e.g., https://soroban-testnet.stellar.org)
+- `FACTORY_CONTRACT_ID`: Stellar contract address for the raffle factory
+
+Optional configuration:
+
+- `DATA_DIR`: Directory for persistent state files (`checkpoint.json` and `dedup.json`). Resolved to an absolute path at startup. In Docker this is the `oracle_data` named volume mounted at `/app/data`. **If this directory is not persisted across restarts the oracle resumes from the current ledger and will miss any `RandomnessRequested` events that arrived while it was down.** (default: `./data`)
+- `LOG_LEVEL`: Logging verbosity (`debug`, `info`, `warn`, `error`; default: `info`)
+- `POLL_INTERVAL_MS`: Event polling interval in milliseconds (default: 5000)
+- `HEALTH_PORT`: Port for `/health` and `/metrics` (default: 9090)
+- `ALERT_WEBHOOK_URL`: Webhook URL for operational alerts
+- `ALERT_FAILURE_THRESHOLD`: Consecutive failures before alerting (default: 3)
+- `ALERT_RATE_LIMIT_MS`: Minimum time between alerts (default: 60000)
+- `ALERT_QUEUE_DEPTH_LIMIT`: Queue depth alert threshold (default: 10)
+- `ALERT_QUEUE_AGE_LIMIT_MS`: Queue age alert threshold (default: 300000)
+- `ALERT_RPC_UNREACHABLE_THRESHOLD`: RPC unreachable alert threshold (default: 3)
+- `ORACLE_RETRY_BASE_MS`: Retry backoff base in milliseconds (default: 500)
+- `ORACLE_RETRY_MAX_MS`: Maximum retry backoff in milliseconds (default: 30000)
+- `ORACLE_RETRY_MAX_ATTEMPTS`: Maximum submission attempts (default: 5)
+
+### Starting the service
+
+```bash
+# From the oracle directory
+npm run build
+npm start
+```
+
+Or directly with Node.js:
+
+```bash
+node dist/src/index.js
+```
+
+### Expected log lines
+
+On successful startup, you should see:
+
+```
+Starting oracle service for contracts: <FACTORY_CONTRACT_ID>
+Oracle service started successfully
+```
+
+If alerts are configured and enabled:
+
+```
+Oracle service started (poll interval <POLL_INTERVAL_MS>ms)
+```
+
+If alerts are disabled (no webhook URL):
+
+```
+ALERT_WEBHOOK_URL is not set; operational alerts are disabled.
+```
+
+### Runtime logs
+
+When processing randomness requests:
+
+```
+Successfully submitted provide_randomness: <tx_hash> for raffle=<contract> requestId=<id>
+```
+
+When skipping duplicates:
+
+```
+Skipping duplicate request: raffle=<contract> requestId=<id>
+```
+
+### Shutdown
+
+On graceful shutdown (SIGINT/SIGTERM):
+
+```
+Shutting down oracle service...
+Received SIGTERM — starting graceful shutdown.
+Draining <n> in-flight job(s) before shutdown.
+Job drained: raffle=<contract> requestId=<id>
+Checkpoint persisted at ledger <n>.
+Graceful shutdown complete. Exiting 0.
+```
+
+If shutdown timeout is exceeded:
+
+```
+Graceful shutdown drain exceeded 30000 ms — forcing exit 1.
+```
+
+## Randomness sources
+
+In single-oracle mode, the oracle signs a message bound to the raffle contract and request ID. The seed submitted on-chain is the first 8 bytes of SHA-256 of that signature proof, interpreted as a big-endian u64; the on-chain verifier independently derives the same value. The wall clock is not a source of seed entropy.
+
+In quorum mode, each participating oracle generates its seed from 8 bytes returned by Node.js `crypto.randomBytes`.
+
+## Pipeline components
+
+The oracle service wires the following components:
+
+1. **KeyService**: Manages the oracle's Ed25519 keypair for signing
+2. **EventListenerService**: Polls Soroban RPC for RandomnessRequested events
+3. **RequestQueue**: Queues jobs for processing with health monitoring
+4. **DeduplicationStore**: Prevents duplicate submissions
+5. **VrfService**: Generates VRF proofs for randomness
+6. **TxSubmitterService**: Submits provide_randomness transactions with retry logic
+7. **GracefulShutdown**: Drains in-flight jobs before exit
+
+## Data persistence
+
+The service creates two data files in the `./data` directory:
+
+- `checkpoint.json`: Last processed ledger number
+- `dedup.json`: Set of processed (raffle_contract, request_id) pairs
+
+Ensure the `./data` directory is writable by the service process.

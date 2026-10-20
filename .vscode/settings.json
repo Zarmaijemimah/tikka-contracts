@@ -1,0 +1,27 @@
+{
+  "editor.formatOnSave": true,
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer"
+  },
+  "[javascript]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "[typescript]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "[json]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "files.associations": {
+    ".prettierrc": "json"
+  },
+  "kiroAgent.configureMCP": "Disabled",
+
+  // Never run a task just because the folder was opened. VS Code defaults to
+  // "off", but the 2026 auto-task malware campaign flipped this setting in a
+  // pull request so a task dropped into .vscode/tasks.json would execute the
+  // moment a contributor opened the repo. Pinning it here makes any attempt to
+  // change it a visible diff in a CODEOWNERS-protected path, and
+  // scripts/check_supply_chain.py fails CI if it is ever set to anything else.
+  "task.allowAutomaticTasks": "off"
+}

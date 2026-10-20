@@ -1,31 +1,34 @@
-import { Keypair } from '@stellar/stellar-sdk';
+import { Keypair, Transaction } from '@stellar/stellar-sdk';
 import { decodeSecretKey, zeroizeBuffer } from './secret-key';
+import { logger } from '../logging/logger';
 
 export interface SecretsAdapter {
-  getSecret(key: string): Promise<string>;
+  getSecret(key: string): Promise<Buffer>;
 }
 
 /**
  * Adapter for loading secrets from environment variables.
  */
 export class EnvSecretsAdapter implements SecretsAdapter {
-  async getSecret(key: string): Promise<string> {
-    const secret = process.env[key];
+  constructor(private readonly environment: Record<string, string | undefined> = {}) {}
+
+  async getSecret(key: string): Promise<Buffer> {
+    const secret = this.environment[key];
     if (!secret) {
-      throw new Error('ORACLE_SECRET_KEY env var not set');
+      throw new Error(`${key} env var not set`);
     }
-    return secret;
+    return Buffer.from(secret);
   }
 }
 
 export class KeyService {
   private keypair!: Keypair;
-  private secretBytes?: Buffer;
+  private secretBytes: Buffer | undefined;
   private initialized = false;
 
   constructor(
     private readonly adapter: SecretsAdapter = new EnvSecretsAdapter(),
-    private readonly secretKeyName: string = 'ORACLE_SECRET_KEY',
+    private readonly secretKeyName: string = 'ORACLE_SECRET_KEY'
   ) {}
 
   /**
@@ -41,16 +44,14 @@ export class KeyService {
       const rawSecret = await this.adapter.getSecret(this.secretKeyName);
       this.secretBytes = decodeSecretKey(rawSecret);
       this.keypair = Keypair.fromRawEd25519Seed(this.secretBytes);
+      if (Buffer.isBuffer(rawSecret)) {
+        zeroizeBuffer(rawSecret);
+      }
       this.initialized = true;
     } catch {
-      console.error('Failed to initialize KeyService: Invalid or missing oracle secret key.');
+      logger.error('Failed to initialize KeyService: Invalid or missing oracle secret key.');
       throw new Error('KeyService initialization failed.');
     }
-  }
-
-  getKeypair(): Keypair {
-    this.ensureInitialized();
-    return this.keypair;
   }
 
   getPublicKey(): string {
@@ -66,6 +67,14 @@ export class KeyService {
   sign(data: Buffer): Buffer {
     this.ensureInitialized();
     return this.keypair.sign(data);
+  }
+
+  /**
+   * Signs a Stellar Transaction directly without exposing the keypair.
+   */
+  signTransaction(tx: Transaction): void {
+    this.ensureInitialized();
+    tx.sign(this.keypair);
   }
 
   /**
