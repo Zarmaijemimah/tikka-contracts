@@ -1,18 +1,61 @@
-import { Keypair } from '@stellar/stellar-sdk';
+import path from 'path';
+import { Keypair, Networks } from '@stellar/stellar-sdk';
 import { decodeSecretKey } from './keys/secret-key';
+import { logger } from './logging/logger';
+import { RetryPolicyOptions } from './tx/retry-policy';
 
 export interface OracleConfig {
-  secretKey: string;
+  oracleSecretKey: string;
   rpcUrl: string;
+  networkPassphrase: string;
   factoryContractId: string;
+  nodeEnv: string;
   logLevel: string;
   pollIntervalMs: number;
+  healthPort: number;
+  metricsPort: number;
+  metricsBindAddress: string;
+  metricsAuthToken: string;
+  alertWebhookUrl: string;
+  alertFailureThreshold: number;
+  alertRateLimitMs: number;
+  alertQueueDepthLimit: number;
+  alertQueueAgeLimitMs: number;
+  alertRpcUnreachableThreshold: number;
+  queueMaxAttempts: number;
+  vaultToken: string;
+  retryPolicy: RetryPolicyOptions;
+  /** Absolute path to the directory used for checkpoint and dedup state files. */
+  dataDir: string;
+  /** Absolute path to the ledger checkpoint JSON file. */
+  checkpointPath: string;
+  /** Absolute path to the deduplication store JSON file. */
+  dedupPath: string;
+  /**
+   * Timeout in milliseconds for a single `simulateTransaction` RPC call made
+   * by QuorumService.  Prevents a hung RPC from stalling the serial queue loop.
+   */
+  rpcSimulateTimeoutMs: number;
+}
+
+function readPositiveInt(name: string, defaultValue: number, errors: string[]): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') {
+    return defaultValue;
+  }
+
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) {
+    errors.push(`${name} must be a positive number`);
+    return defaultValue;
+  }
+
+  return Math.floor(value);
 }
 
 function isValidSecretKey(secret: string): boolean {
   const trimmed = secret.trim();
 
-  // Accept Stellar S... secrets directly.
   if (trimmed.startsWith('S')) {
     try {
       Keypair.fromSecret(trimmed);
@@ -22,7 +65,6 @@ function isValidSecretKey(secret: string): boolean {
     }
   }
 
-  // Reuse existing decoder support (hex/base64) and enforce 32-byte seed.
   try {
     const decoded = decodeSecretKey(trimmed);
     return decoded.length === 32;
@@ -34,42 +76,102 @@ function isValidSecretKey(secret: string): boolean {
 export function loadAndValidateConfig(): OracleConfig {
   const errors: string[] = [];
 
-  const secretKey = process.env.ORACLE_SECRET_KEY;
-  if (!secretKey) {
+  const oracleSecretKey = process.env['ORACLE_SECRET_KEY'];
+  if (!oracleSecretKey) {
     errors.push('ORACLE_SECRET_KEY is required');
-  } else if (!isValidSecretKey(secretKey)) {
-    errors.push('ORACLE_SECRET_KEY is not a valid Ed25519 secret key');
+  } else if (!isValidSecretKey(oracleSecretKey)) {
+    errors.push('ORACLE_SECRET_KEY is invalid');
   }
 
-  const rpcUrl = process.env.STELLAR_RPC_URL;
+  const rpcUrl = process.env['STELLAR_RPC_URL'];
   if (!rpcUrl) {
     errors.push('STELLAR_RPC_URL is required');
   }
 
-  const factoryContractId = process.env.FACTORY_CONTRACT_ID;
+  const factoryContractId = process.env['FACTORY_CONTRACT_ID'];
   if (!factoryContractId) {
     errors.push('FACTORY_CONTRACT_ID is required');
   }
 
-  const rawPollInterval = process.env.POLL_INTERVAL_MS ?? process.env.ORACLE_POLL_INTERVAL_MS ?? '5000';
+  const networkPassphrase = process.env['STELLAR_NETWORK_PASSPHRASE'] ?? Networks.TESTNET;
+  const nodeEnv = process.env['NODE_ENV'] ?? 'development';
+
+  const rawPollInterval =
+    process.env['POLL_INTERVAL_MS'] ?? process.env['ORACLE_POLL_INTERVAL_MS'] ?? '5000';
   const pollIntervalMs = Number(rawPollInterval);
   if (!Number.isFinite(pollIntervalMs) || pollIntervalMs <= 0) {
     errors.push('POLL_INTERVAL_MS must be a positive number');
   }
 
+  const alertWebhookUrl = process.env['ALERT_WEBHOOK_URL'] ?? '';
+  const healthPort = readPositiveInt('HEALTH_PORT', 9090, errors);
+  const metricsPort = readPositiveInt('METRICS_PORT', 9091, errors);
+  if (metricsPort === healthPort) {
+    errors.push('METRICS_PORT must differ from HEALTH_PORT');
+  }
+  const metricsBindAddress = process.env['METRICS_BIND_ADDRESS']?.trim() || '127.0.0.1';
+  const metricsAuthToken = process.env['METRICS_AUTH_TOKEN']?.trim() ?? '';
+  if (!metricsAuthToken && metricsBindAddress !== '127.0.0.1' && metricsBindAddress !== '::1') {
+    errors.push('METRICS_AUTH_TOKEN is required when METRICS_BIND_ADDRESS is not loopback');
+  }
+  const alertFailureThreshold = readPositiveInt('ALERT_FAILURE_THRESHOLD', 3, errors);
+  const alertRateLimitMs = readPositiveInt('ALERT_RATE_LIMIT_MS', 60_000, errors);
+  const alertQueueDepthLimit = readPositiveInt('ALERT_QUEUE_DEPTH_LIMIT', 10, errors);
+  const alertQueueAgeLimitMs = readPositiveInt('ALERT_QUEUE_AGE_LIMIT_MS', 300_000, errors);
+  const alertRpcUnreachableThreshold = readPositiveInt(
+    'ALERT_RPC_UNREACHABLE_THRESHOLD',
+    3,
+    errors
+  );
+  const queueMaxAttempts = readPositiveInt('QUEUE_MAX_ATTEMPTS', 5, errors);
+  const retryPolicy: RetryPolicyOptions = {
+    baseMs: readPositiveInt('ORACLE_RETRY_BASE_MS', 500, errors),
+    maxMs: readPositiveInt('ORACLE_RETRY_MAX_MS', 30_000, errors),
+    maxAttempts: readPositiveInt('ORACLE_RETRY_MAX_ATTEMPTS', 5, errors),
+  };
+  const rpcSimulateTimeoutMs = readPositiveInt('RPC_SIMULATE_TIMEOUT_MS', 10_000, errors);
+
   if (errors.length > 0) {
-    console.error('Configuration errors:');
+    logger.error('Configuration errors:');
     for (const error of errors) {
-      console.error(` - ${error}`);
+      logger.error(` - ${error}`);
     }
     process.exit(1);
   }
 
+  // At this point errors.length === 0, so rpcUrl, factoryContractId, and oracleSecretKey are defined and valid.
+  // The non-null assertions below are replaced by explicit narrowing guards above
+  // (process.exit(1) means we never reach here with undefined values).
+
+  // Resolve data directory to an absolute path so it is CWD-independent.
+  const dataDir = path.resolve(process.env['DATA_DIR'] ?? './data');
+  const checkpointPath = path.join(dataDir, 'checkpoint.json');
+  const dedupPath = path.join(dataDir, 'dedup.json');
+
   return {
-    secretKey: secretKey!,
-    rpcUrl: rpcUrl!,
-    factoryContractId: factoryContractId!,
-    logLevel: process.env.LOG_LEVEL ?? 'info',
+    rpcUrl: rpcUrl as string,
+    factoryContractId: factoryContractId as string,
+    logLevel: process.env['LOG_LEVEL'] ?? 'info',
     pollIntervalMs,
+    healthPort,
+    metricsPort,
+    metricsBindAddress,
+    metricsAuthToken,
+    alertWebhookUrl,
+    alertFailureThreshold,
+    alertRateLimitMs,
+    alertQueueDepthLimit,
+    alertQueueAgeLimitMs,
+    alertRpcUnreachableThreshold,
+    retryPolicy,
+    dataDir,
+    checkpointPath,
+    dedupPath,
+    rpcSimulateTimeoutMs,
+    oracleSecretKey: oracleSecretKey ?? '',
+    networkPassphrase,
+    nodeEnv,
+    queueMaxAttempts,
+    vaultToken: process.env['VAULT_TOKEN'] ?? '',
   };
 }
