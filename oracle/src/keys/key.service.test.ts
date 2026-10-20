@@ -25,27 +25,27 @@ describe('KeyService', () => {
   const keypair = Keypair.random();
 
   beforeEach(() => {
-    process.env.ORACLE_SECRET_KEY = keypair.secret();
+    process.env['ORACLE_SECRET_KEY'] = keypair.secret();
   });
 
   afterEach(() => {
-    delete process.env.ORACLE_SECRET_KEY;
+    delete process.env['ORACLE_SECRET_KEY'];
   });
 
   it('loads and validates the key on startup', async () => {
-    const service = new KeyService();
+    const service = new KeyService(new EnvSecretsAdapter(process.env));
     await service.initialize();
     expect(service.getPublicKey()).toBe(keypair.publicKey());
   });
 
   it('fails startup when the secret is missing', async () => {
-    delete process.env.ORACLE_SECRET_KEY;
-    const service = new KeyService();
+    delete process.env['ORACLE_SECRET_KEY'];
+    const service = new KeyService(new EnvSecretsAdapter(process.env));
     await expect(service.initialize()).rejects.toThrow('KeyService initialization failed.');
   });
 
   it('signs and verifies a message with the loaded key', async () => {
-    const service = new KeyService();
+    const service = new KeyService(new EnvSecretsAdapter(process.env));
     await service.initialize();
 
     const message = Buffer.from('oracle-proof-message');
@@ -55,14 +55,96 @@ describe('KeyService', () => {
   });
 
   it('never exposes the secret in error messages', async () => {
-    const service = new KeyService(new EnvSecretsAdapter(), 'MISSING_SECRET');
+    const service = new KeyService(new EnvSecretsAdapter(process.env), 'MISSING_SECRET');
     await expect(service.initialize()).rejects.toThrow('KeyService initialization failed.');
   });
 
   it('zeroizes secret bytes on shutdown', async () => {
-    const service = new KeyService();
+    const service = new KeyService(new EnvSecretsAdapter(process.env));
     await service.initialize();
+
+    // Capture a reference to the internal secretBytes buffer before shutdown.
+    // We cast through unknown to access the private field — this is intentional
+    // in a security test: we need to verify the actual memory was wiped, not
+    // just that the public API rejects calls.
+    const internals = service as unknown as { secretBytes: Buffer | undefined };
+    const secretBuf = internals.secretBytes;
+    expect(secretBuf).toBeDefined();
+    // Confirm it holds non-zero key material before the call.
+    expect(secretBuf!.some((b) => b !== 0)).toBe(true);
+
     service.shutdown();
+
+    // The buffer must be all-zero after zeroization.
+    expect(secretBuf!.every((b) => b === 0)).toBe(true);
+    // The internal reference must be cleared so the buffer can be GC'd.
+    expect(internals.secretBytes).toBeUndefined();
+    // The public API must also be locked out.
     expect(() => service.sign(Buffer.from('x'))).toThrow('not initialized');
+  });
+
+  it('allows two sequential initialisations without deleting env var', async () => {
+    const adapter = new EnvSecretsAdapter(process.env);
+    const secret1 = await adapter.getSecret('ORACLE_SECRET_KEY');
+    const secret2 = await adapter.getSecret('ORACLE_SECRET_KEY');
+    expect(secret1.toString('hex')).toBe(secret2.toString('hex'));
+    expect(process.env['ORACLE_SECRET_KEY']).toBeDefined();
+  });
+
+  it('names the missing variable in EnvSecretsAdapter error message', async () => {
+    const adapter = new EnvSecretsAdapter(process.env);
+    await expect(adapter.getSecret('CUSTOM_VAR')).rejects.toThrow('CUSTOM_VAR env var not set');
+  });
+});
+
+import nock from 'nock';
+import { VaultSecretsAdapter } from './key.service';
+
+describe('VaultSecretsAdapter', () => {
+  const vaultAddr = 'http://localhost:8200';
+  const token = 's.mocktoken';
+
+  it('fetches a secret from vault KV store', async () => {
+    const adapter = new VaultSecretsAdapter(vaultAddr, token);
+    const fetchSpy = jest.spyOn(global, 'fetch').mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        data: {
+          data: {
+            value: 'SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4',
+          },
+        },
+      }),
+    } as any);
+
+    const secret = await adapter.getSecret('secret/oracle');
+    expect(secret.toString()).toBe('SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4');
+    expect(fetchSpy).toHaveBeenCalledWith(
+      `${vaultAddr}/v1/secret/oracle`,
+      expect.objectContaining({
+        headers: { 'X-Vault-Token': token },
+      })
+    );
+    fetchSpy.mockRestore();
+  });
+
+  it('throws when vault token is missing', async () => {
+    const adapter = new VaultSecretsAdapter(vaultAddr, '');
+    await expect(adapter.getSecret('secret/oracle')).rejects.toThrow('Vault token is required');
+  });
+
+  it('throws on non-200 responses', async () => {
+    const adapter = new VaultSecretsAdapter(vaultAddr, token);
+    const fetchSpy = jest.spyOn(global, 'fetch').mockResolvedValue({
+      ok: false,
+      status: 403,
+      statusText: 'Forbidden',
+    } as any);
+
+    await expect(adapter.getSecret('secret/oracle')).rejects.toThrow(
+      'Failed to fetch secret from Vault'
+    );
+    fetchSpy.mockRestore();
   });
 });

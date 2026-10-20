@@ -1,12 +1,16 @@
-# Rust's output and lock files
+# Rust's output
 target/
 *.wasm
-Cargo.lock
+
+# Cargo.lock is deliberately tracked: these are deployable contracts, not a
+# library, and byte-reproducible builds need the exact dependency graph (#843).
 
 # Node dependencies and build artifacts
 node_modules/
 oracle/node_modules/
 oracle/dist/
+oracle/coverage/
+coverage/lcov.info
 
 # Local Stellar/Soroban settings and deployments
 .soroban/
@@ -31,8 +35,15 @@ CLAUDE.md
 # Cursor IDE files
 .cursor/
 
+# Kiro IDE files
+.kiro/
+
 # Test snapshots
 test_snapshots/
+
+# Python tooling cache (scripts/*.py)
+__pycache__/
+*.pyc
 
 # Skills
 .windsurf/
@@ -48,7 +59,13 @@ issue.md
 *.log
 output*.txt
 test_out*.txt
+test_output*.txt
 check_out*.txt
 error*.txt
 *.tar.gz
-patch*.py
+# Agent / scratch artefacts
+patch_*.txt
+scratch_*.rs
+/test_*.rs
+update_*.py
+inject_*.py

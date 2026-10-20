@@ -1,3 +1,5 @@
+[workspace]
+
 [package]
 name    = "raffle-fuzz"
 version = "0.0.0"
@@ -26,15 +28,26 @@ name = "fuzz_winner_selection"
 path = "fuzz_targets/fuzz_winner_selection.rs"
 test = false
 
+[[bin]]
+name = "fuzz_refund_cancel"
+path = "fuzz_targets/fuzz_refund_cancel.rs"
+test = false
+
+[[bin]]
+name = "fuzz_commit_reveal"
+path = "fuzz_targets/fuzz_commit_reveal.rs"
+test = false
+
+[[bin]]
+name = "fuzz_lifecycle"
+path = "fuzz_targets/fuzz_lifecycle.rs"
+test = false
+
 [dependencies]
 # libfuzzer-sys wires rust code to LLVM libFuzzer
 libfuzzer-sys = "0.4"
 # Derives arbitrary byte→type conversion for fuzzer inputs
 arbitrary     = { version = "1", features = ["derive"] }
 # Local contracts
-tikka-raffle-instance = { package = "raffle-instance", path = "../contracts/raffle-instance", features = ["std"] }
-
-[profile.release]
-# Optimisation level useful for fuzzing; debug info helps with crash reports
-opt-level = 3
-debug     = false
+tikka-raffle-instance = { package = "raffle-instance", path = "../contracts/raffle-instance", features = ["std", "testutils"] }
+soroban-sdk = { version = "23", features = ["testutils"] }

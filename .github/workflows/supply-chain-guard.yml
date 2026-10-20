@@ -1,0 +1,26 @@
+name: Supply Chain Guard
+
+# Runs on every branch and every pull request, with no `paths:` filter: the
+# point of this check is to catch files appearing where they are not expected,
+# so it must not be skipped based on which files a change happens to touch.
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: Editor and install-time execution vectors
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Scan tracked files
+        run: python3 scripts/check_supply_chain.py

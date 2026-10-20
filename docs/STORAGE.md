@@ -2,7 +2,7 @@
 
 Canonical map of Soroban storage keys for **raffle-factory** and **raffle-instance**: tier (instance vs persistent), write pattern, archival risk, and operator TTL guidance.
 
-> Soroban deletes expired entries permanently. These contracts do **not** call `extend_ttl` on-chain; operators must bump TTLs externally (Stellar CLI / cron). See also the TTL section in [DEVELOPMENT.md](../DEVELOPMENT.md).
+> Soroban deletes expired entries permanently. These contracts **do** call `extend_ttl` on-chain in hot paths (`buy_tickets`, `finalize_raffle`) and expose a permissionless `extend_ttl()` entrypoint on every raffle instance so anyone can keep a raffle alive. Operators may still bump TTLs externally (Stellar CLI / cron) for added resilience. See also the TTL section in [DEVELOPMENT.md](DEVELOPMENT.md).
 
 ## Storage tiers (quick reference)
 
@@ -81,10 +81,27 @@ Source of truth: `DataKey` enum (and admin-cancel flow keys noted below).
 | `RandomnessSeed` | **Persistent** (fairness metadata); readers may also check instance in older paths | On successful finalize | Audit / dispute | Prefer keep after finalize | `FairnessMetadata` / seed fingerprint for `get_fairness_data` |
 | `Ticket(u32)` | **Persistent** | Per purchased ticket | Yes | No until refunds/claims done | Owner + purchase metadata |
 | `TicketCount(Address)` | **Persistent** | Updated per buy | Yes | No until cleanup | Per-buyer counts |
-| `OwnerTickets(Address)` | **Persistent** | Appended per buy | Yes | No until cleanup | O(1) owner → ticket IDs index |
+| `OwnerTickets(Address)` | **Persistent** | Reserved; not currently written | No | N/A | Intended owner → ticket IDs index |
 | `TicketBuyers` | **Persistent** | Appended when buyer first appears | Yes | No until cleanup | Buyer enumeration for cleanup/refunds |
 | `TicketRefunded(u32)` | **Persistent** | Once per refunded/claimed ticket | Yes | After full settlement | Idempotency marker |
 | `CommitEntry(u32)` | **Persistent** | `submit_commit` (CommitReveal mode) | Yes until draw | After finalize OK | Hash keyed by **ticket ID** (survives transfer) |
+
+### `Winner` entry (within the `Raffle` blob)
+
+`Raffle.winners` is a `Vec<Winner>` holding one entry per prize tier in draw
+order. It is a unified winner record that replaces the old parallel-array
+pattern (`winners: Vec<Address>` + `claimed_winners: Vec<bool>`). Each entry is
+written at finalization, and its `claimed` flag flips true on claim or sweep:
+
+| Field          | Type     | Meaning                                                                 |
+|----------------|----------|-------------------------------------------------------------------------|
+| `address`      | `Address`| Address that owned the winning ticket at draw time.                     |
+| `claimed`      | `bool`   | True once this tier's prize has been paid out or swept.                 |
+| `tier_index`   | `u32`    | Index into `Raffle::prizes` identifying the tier won.                   |
+
+`tier_index` names the tier consistently with `WinnerDrawn`, `PrizeClaimed`,
+`PrizeSwept`, and `claim_prize`. The type is defined in `raffle-shared` with
+`#[contracttype]` so it can be shared across contracts.
 
 ### Admin-cancel timelock key
 
@@ -111,6 +128,20 @@ Admin cancellation scheduling (`execute_admin_cancel` / related flows) stores a 
 | `RandomnessSeed` — disputes possible | Policy retention window post-finalize |
 | Oracle pending keys | `provide_randomness` or fallback completes |
 
+### `wipe_storage`
+
+The `wipe_storage` entrypoint is an authenticated factory operation for
+reclaiming settlement-era storage. It is allowed only when the raffle status
+is `Claimed`, `Cancelled`, or `Failed`, and the instance balance is zero for
+both `payment_token` and `prize_token`. A non-zero balance rejects the call so
+that escrowed funds cannot become unreachable.
+
+On success it removes ticket records, refund markers, commit-reveal entries,
+buyer and owner-ticket indexes, quorum randomness entries, and transient
+lifecycle keys. It retains `Raffle`, `Factory`, `Admin`, and
+`RandomnessSeed`; these remain required by read, attestation, fairness, and
+privileged paths. The operation emits `StorageWiped` for indexers.
+
 ---
 
 ## Recommended TTL bump policy
@@ -132,9 +163,80 @@ stellar contract extend \
 
 Persistent keys need `--durability persistent` and `--key …` (or batched tooling). Ticket keys are **independent** of the instance TTL — bumping only the instance is not enough for long-running sales.
 
+## Tombstone model for `clean_old_raffle`
+
+`clean_old_raffle` removes a raffle from the stable map without shifting IDs:
+
+- `RaffleById(id)` is removed — the slot becomes a tombstone.
+- `NextRaffleId` is never decremented — IDs are never reused.
+- `RaffleCount` is decremented — this is the count of **live** raffles.
+- `CreatorRaffles` and `CategoryRaffles` are pruned — tombstones do not appear in per-creator or per-category views.
+
+### What `total` means in pagination
+
+- `get_raffles_page` returns `total = RaffleCount` (live raffles only).
+- `get_raffles_by_creator` returns `total = creator_vec.len()` (after pruning).
+- `get_raffles_by_category` returns `total = category_vec.len()` (after pruning).
+
+### Pagination semantics over a sparse ID space
+
+`get_raffles_page` collects all live raffles by scanning `RaffleById(0..NextRaffleId)`, skipping tombstones, then applies `offset` and `limit` on the dense live list. This guarantees:
+
+- No gaps or repeats across pages.
+- `has_more` is consistent with `total`.
+- Tombstoned raffles are invisible to every query path.
+
 ## Related docs
 
 - [DEPLOYMENT.md](DEPLOYMENT.md) — deploy then operate
 - [RANDOMNESS.md](RANDOMNESS.md) — how draw keys are used
 - [ARCHITECTURE.md](ARCHITECTURE.md) — lifecycle states
 - [COMMIT_REVEAL.md](COMMIT_REVEAL.md) — `CommitEntry` protocol
+
+## Raffle TTL Management
+
+### Instance TTL
+
+The raffle instance entry is bumped on every `buy_tickets`,
+`finalize_raffle`, and `extend_ttl` call.
+
+- **Threshold**: `INSTANCE_TTL_THRESHOLD_LEDGERS` (1,555,200 ledgers / ~3 months)
+- **Bump to**: `INSTANCE_TTL_BUMP_LEDGERS` (3,110,400 ledgers / ~6 months)
+- **Frequency**: Bumped unconditionally on every purchase and finalize
+
+### Ticket TTL (bounded window + operator pagination)
+
+Ticket records live in **persistent** storage — `Ticket(id)`,
+`TicketCount(addr)`, `TicketRefunded(id)`, `OwnerTickets(addr)` — with their
+own per-key TTLs, independent of the instance entry. Bumping all of them per
+purchase would be O(n), so the work is split (#1010):
+
+| Call | Keys bumped | Window |
+|---|---|---|
+| `buy_tickets` / `buy_tickets_for` (via `bump_raffle_ttl`) | Instance entry + rolling window of `Ticket(id)` | `TTL_BUMP_WINDOW` (100) entries per call, cycling via `LastBumpedIndex` |
+| `buy_tickets` touched-ticket bump (via `bump_touched_tickets`) | The `quantity` tickets minted by this call + buyer's `TicketCount` and `OwnerTickets` (+ `TicketRefunded` slots) | Exactly the tickets touched by the call |
+| `extend_ttl(start_ticket_id, limit)` (permissionless, paginated) | Instance entry + `limit` `Ticket(id)` entries from `start_ticket_id` | Operator-chosen; returns the refreshed count |
+| `finalize_raffle` (via `bump_raffle_ttl`) | Instance entry + next rolling window | Same 100-entry window |
+
+### Retention window
+
+Every bump above extends entries to **3,110,400 ledgers (~6 months)** with a
+**1,555,200-ledger (~3-month)** threshold, matching the instance policy:
+
+- `PERSISTENT_TTL_THRESHOLD_LEDGERS` = 1,555,200 (~3 months)
+- `PERSISTENT_TTL_BUMP_LEDGERS` = 3,110,400 (~6 months)
+
+Operators of long-running (especially `no_deadline`) raffles should call
+`extend_ttl(start, limit)` page by page (e.g. 100–500 entries per call)
+monthly, so no ticket record ever approaches expiry while sales, refunds,
+or claims are still possible.
+
+### Why this works
+
+- Each purchase refreshes the instance entry, the tickets it just minted,
+  the buyer's index entries, and the next 100-entry rolling window.
+- Over time, repeated purchases cycle through all tickets.
+- Gaps (quiet raffles with no purchases) are covered by the permissionless
+  paginated `extend_ttl`, which anyone — not just the admin — can call.
+- Tickets expire only ~6 months after their last bump, giving winners ample
+  time to claim.

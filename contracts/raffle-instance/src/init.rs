@@ -20,21 +20,23 @@
 //!                                                  ticket sales open
 //! ```
 //!
-//! See [`docs/RANDOMNESS.md`](../../../../docs/RANDOMNESS.md) for a full
+//! See [`docs/RANDOMNESS.md`](../../../docs/RANDOMNESS.md) for a full
 //! explanation of the three randomness modes that can be configured here, and
-//! [`docs/EVENTS.md`](../../../../docs/EVENTS.md) for the events emitted by
+//! [`docs/EVENTS.md`](../../../docs/EVENTS.md) for the events emitted by
 //! these functions.
 
-use soroban_sdk::{token, Address, BytesN, Env, String};
+use soroban_sdk::{token, Address, Env};
 
-use raffle_shared::constants::MAX_CATEGORY_LENGTH;
-use raffle_shared::{RaffleConfig, RandomnessSource};
+use raffle_shared::config_builder::{validate_config, ConfigValidationError};
+use raffle_shared::constants::{
+    DEFAULT_CLAIM_EXPIRY_SECONDS, DEFAULT_CLAIM_LOCKUP_SECONDS, DEFAULT_SWAP_DEADLINE_SECONDS,
+};
+use raffle_shared::RaffleConfig;
 
-use crate::events::{PrizeDeposited, RaffleCreated, RaffleStatusChanged};
+use crate::events::{PrizeDeposited, RaffleCreated};
 use crate::{
-    read_raffle, require_not_paused, validate_token_address, write_raffle, DataKey, Error, Raffle,
-    MAX_CLAIM_LOCKUP_SECONDS, MAX_DESCRIPTION_LENGTH, MAX_PRIZES, MAX_PRIZE_AMOUNT,
-    MAX_SWAP_DEADLINE_SECONDS, MAX_TICKETS_LIMIT, MIN_TICKET_PRICE, RaffleStatus,
+    helpers::{read_raffle, require_not_paused, transition_status},
+    write_raffle, DataKey, Error, Raffle, RaffleStatus,
 };
 
 /// Initialise a freshly-deployed raffle-instance contract.
@@ -52,16 +54,18 @@ use crate::{
 /// | `end_time` | Must be in the future unless `no_deadline = true`; `no_deadline` requires `end_time == 0` |
 /// | `max_tickets` | `1 ≤ max_tickets ≤ MAX_TICKETS_LIMIT` (100 000) |
 /// | `max_tickets_per_tx` | `1 ≤ max_tickets_per_tx ≤ max_tickets` |
+/// | `max_tickets_per_address` | `≤ max_tickets`; `0` = unlimited. Enforced per-address at purchase time (both `buy_tickets` and `buy_tickets_for`) via `Error::ExceedsMaxTicketsPerAddress` |
 /// | `min_tickets` | `min_tickets ≤ max_tickets` |
 /// | `ticket_price` | `≥ MIN_TICKET_PRICE` (10 000 stroops) |
 /// | `prize_amount` | `ticket_price ≤ prize_amount ≤ MAX_PRIZE_AMOUNT` |
 /// | `prizes` | Non-empty, `len ≤ MAX_PRIZES` (100), basis-points sum == 10 000 |
-/// | `protocol_fee_bp` | `≤ 10 000` |
+/// | `protocol_fee_bp` | `≤ 10 000`; applied to ticket purchases and prize claims |
 /// | `oracle_address` | Required (and not self) when `randomness_source == External`; forbidden otherwise |
 /// | `metadata_hash` | Must not be the all-zero 32-byte value |
 /// | `category` | See [`validate_category`] |
 /// | `payment_token` | Must be a valid SAC (queried via `try_decimals`) |
 /// | `claim_lockup_seconds` | `≤ MAX_CLAIM_LOCKUP_SECONDS` (7 days) after `resolve_defaults` |
+/// | `claim_expiry_seconds` | `≥ MIN_CLAIM_EXPIRY_SECONDS` and greater than the claim lockup after `resolve_defaults` |
 /// | `swap_deadline_seconds` | `≤ MAX_SWAP_DEADLINE_SECONDS` (3 600 s) after `resolve_defaults` |
 ///
 /// # Parameters
@@ -89,89 +93,35 @@ use crate::{
 /// Emits [`events::RaffleCreated`].
 ///
 /// See also: [`docs/EVENTS.md`](../../../../docs/EVENTS.md) — `RaffleCreated`.
+#[allow(dead_code)]
 pub(crate) fn init(
     env: Env,
     factory: Address,
     admin: Address,
     creator: Address,
-    config: RaffleConfig,
+    mut config: RaffleConfig,
 ) -> Result<(), Error> {
     if env.storage().instance().has(&DataKey::Raffle) {
         return Err(Error::AlreadyInitialized);
     }
 
-    if config.description.len() > MAX_DESCRIPTION_LENGTH {
-        return Err(Error::InvalidParameters);
-    }
-
-    let now = env.ledger().timestamp();
-    if config.no_deadline && config.end_time != 0 {
-        return Err(Error::InvalidParameters);
-    }
-    if !config.no_deadline && config.end_time <= now {
-        return Err(Error::InvalidParameters);
-    }
-    if config.end_time != 0 && config.end_time <= now {
-        return Err(Error::InvalidEndTime);
-    }
-    if config.max_tickets == 0 || config.max_tickets > MAX_TICKETS_LIMIT {
-        return Err(Error::InvalidParameters);
-    }
-    if config.max_tickets < config.min_tickets {
-        return Err(Error::InvalidTicketRange);
-    }
-    if config.max_tickets_per_tx == 0 || config.max_tickets_per_tx > config.max_tickets {
-        return Err(Error::InvalidParameters);
-    }
-    if config.ticket_price < MIN_TICKET_PRICE {
-        return Err(Error::InvalidParameters);
-    }
-    if config.prize_amount < config.ticket_price {
-        return Err(Error::InvalidParameters);
-    }
-    if config.prize_amount > MAX_PRIZE_AMOUNT {
-        return Err(Error::InvalidParameters);
-    }
-    if config.prizes.is_empty() {
-        return Err(Error::InvalidParameters);
-    }
-    if config.prizes.len() > MAX_PRIZES {
-        return Err(Error::TooManyPrizes);
-    }
-    let mut total = 0u32;
-    for bp in config.prizes.iter() {
-        total += bp;
-    }
-    if total != 10000 {
-        return Err(Error::InvalidParameters);
-    }
-    if config.protocol_fee_bp > 10000 {
-        return Err(Error::InvalidParameters);
-    }
-    if config.randomness_source == RandomnessSource::External {
-        match &config.oracle_address {
-            None => return Err(Error::InvalidParameters),
-            Some(addr) if *addr == env.current_contract_address() => return Err(Error::InvalidParameters),
-            Some(_) => {}
-        }
-    }
-    if config.randomness_source != RandomnessSource::External && config.oracle_address.is_some() {
-        return Err(Error::InvalidParameters);
-    }
-    if config.metadata_hash == BytesN::from_array(&env, &[0u8; 32]) {
-        return Err(Error::InvalidParameters);
-    }
-    validate_category(&config.category)?;
-
-    validate_token_address(&env, &config.payment_token)?;
-    let config = config.resolve_defaults();
-
-    if config.claim_lockup_seconds > MAX_CLAIM_LOCKUP_SECONDS {
-        return Err(Error::InvalidParameters);
-    }
-    if config.swap_deadline_seconds > MAX_SWAP_DEADLINE_SECONDS {
-        return Err(Error::InvalidParameters);
-    }
+    let instance_address = env.current_contract_address();
+    validate_config(&env, &mut config, Some(&instance_address)).map_err(|error| match error {
+        ConfigValidationError::InvalidParameters => Error::InvalidParameters,
+        ConfigValidationError::InvalidTicketRange => Error::InvalidTicketRange,
+        ConfigValidationError::InvalidEndTime => Error::InvalidEndTime,
+        ConfigValidationError::TooManyPrizes => Error::TooManyPrizes,
+        ConfigValidationError::InvalidTokenAddress => Error::InvalidTokenAddress,
+    })?;
+    let claim_expiry = config
+        .claim_expiry_seconds
+        .unwrap_or(DEFAULT_CLAIM_EXPIRY_SECONDS);
+    let claim_lockup = config
+        .claim_lockup_seconds
+        .unwrap_or(DEFAULT_CLAIM_LOCKUP_SECONDS);
+    let swap_deadline = config
+        .swap_deadline_seconds
+        .unwrap_or(DEFAULT_SWAP_DEADLINE_SECONDS);
 
     let raffle = Raffle {
         creator: creator.clone(),
@@ -182,28 +132,34 @@ pub(crate) fn init(
         max_tickets_per_tx: config.max_tickets_per_tx,
         min_tickets: config.min_tickets,
         allow_multiple: config.allow_multiple,
+        max_tickets_per_address: config.max_tickets_per_address,
         ticket_price: config.ticket_price,
         payment_token: config.payment_token.clone(),
-        prize_token: config.payment_token.clone(),
+        prize_token: prize_token.clone(),
         prize_amount: config.prize_amount,
         prizes: config.prizes.clone(),
         tickets_sold: 0,
         status: RaffleStatus::PendingPrize,
         prize_deposited: false,
         winners: soroban_sdk::Vec::new(&env),
-        claimed_winners: soroban_sdk::Vec::new(&env),
+        claim_expiry_seconds: claim_expiry,
         randomness_source: config.randomness_source.clone(),
         oracle_address: config.oracle_address,
+        oracle_public_key: config.oracle_public_key,
         protocol_fee_bp: config.protocol_fee_bp,
         treasury_address: config.treasury_address,
         swap_router: config.swap_router,
         tikka_token: config.tikka_token,
         finalized_at: None,
-        claim_lockup_seconds: config.claim_lockup_seconds,
-        swap_deadline_seconds: config.swap_deadline_seconds,
+        claim_lockup_seconds: claim_lockup,
+        swap_deadline_seconds: swap_deadline,
         ticket_sales_paused: false,
         early_bird_ticket_percentage: config.early_bird_ticket_percentage,
         early_bird_discount_bp: config.early_bird_discount_bp,
+        metadata_hash: config.metadata_hash.clone(),
+        unique_winners: config.unique_winners,
+        nft_contract: config.nft_contract,
+        bundles: config.bundles.clone(),
     };
     write_raffle(&env, &raffle);
     env.storage().instance().set(&DataKey::Factory, &factory);
@@ -221,46 +177,9 @@ pub(crate) fn init(
         description: config.description,
         randomness_source: config.randomness_source,
         metadata_hash: config.metadata_hash,
+        unique_winners: config.unique_winners,
+        claim_expiry_seconds: claim_expiry,
     }.publish(&env);
-
-    Ok(())
-}
-
-/// Validate the optional on-chain raffle category (#439).
-///
-/// A `None` category is always valid. When present, the category must satisfy:
-///
-/// - **Non-empty** — a zero-length string is rejected as meaningless.
-/// - **Length ≤ [`MAX_CATEGORY_LENGTH`]** (32 bytes) — keeps the storage key
-///   compact and prevents DoS via oversized keys.
-/// - **Charset: ASCII alphanumerics and hyphens only** (`[a-zA-Z0-9-]`) —
-///   safe for use as a URL/filter token on the frontend and as a Soroban
-///   storage-key namespace without escaping.
-///
-/// # Errors
-///
-/// - [`Error::InvalidParameters`] — category is present but empty, too long,
-///   or contains disallowed characters.
-fn validate_category(category: &Option<String>) -> Result<(), Error> {
-    let Some(cat) = category else {
-        return Ok(());
-    };
-
-    let len = cat.len();
-    if len == 0 || len > MAX_CATEGORY_LENGTH {
-        return Err(Error::InvalidParameters);
-    }
-
-    // Copy the exact bytes out of the Soroban String and validate the charset.
-    let mut buf = [0u8; MAX_CATEGORY_LENGTH as usize];
-    let slice = &mut buf[..len as usize];
-    cat.copy_into_slice(slice);
-    for &b in slice.iter() {
-        let is_allowed = b.is_ascii_alphanumeric() || b == b'-';
-        if !is_allowed {
-            return Err(Error::InvalidParameters);
-        }
-    }
 
     Ok(())
 }
@@ -277,7 +196,7 @@ fn validate_category(category: &Option<String>) -> Result<(), Error> {
 /// 1. Checks the contract is not paused.
 /// 2. Requires authorization from `raffle.creator`.
 /// 3. Guards against a second deposit (`prize_deposited == true`).
-/// 4. Calls `try_transfer` on the payment token to pull `prize_amount` from
+/// 4. Calls `try_transfer` on the prize token to pull `prize_amount` from
 ///    the creator into this contract address.
 /// 5. Sets `prize_deposited = true` and transitions status from
 ///    [`RaffleStatus::PendingPrize`] → [`RaffleStatus::Active`].
@@ -303,7 +222,7 @@ fn validate_category(category: &Option<String>) -> Result<(), Error> {
 /// - [`events::RaffleStatusChanged`] — records the `PendingPrize → Active`
 ///   transition.
 ///
-/// See also: [`docs/EVENTS.md`](../../../../docs/EVENTS.md) — `PrizeDeposited`,
+/// See also: [`docs/EVENTS.md`](../../../docs/EVENTS.md) — `PrizeDeposited`,
 /// `RaffleStatusChanged`.
 pub(crate) fn deposit_prize(env: Env) -> Result<(), Error> {
     require_not_paused(&env)?;
@@ -314,20 +233,16 @@ pub(crate) fn deposit_prize(env: Env) -> Result<(), Error> {
         return Err(Error::PrizeAlreadyDeposited);
     }
 
-    let old_status = raffle.status.clone();
-
-    let token_client = token::Client::new(&env, &raffle.payment_token);
+    let token_client = token::Client::new(&env, &raffle.prize_token);
     let _ = token_client
         .try_transfer(&raffle.creator, env.current_contract_address(), &raffle.prize_amount)
         .map_err(|_| Error::TokenTransferFailed)?;
 
     raffle.prize_deposited = true;
-    raffle.status = RaffleStatus::Active;
-    write_raffle(&env, &raffle);
-
     let ts = env.ledger().timestamp();
-    PrizeDeposited { creator: raffle.creator.clone(), amount: raffle.prize_amount, token: raffle.payment_token.clone(), timestamp: ts }.publish(&env);
-    RaffleStatusChanged { old_status, new_status: RaffleStatus::Active, timestamp: ts }.publish(&env);
+    transition_status(&env, &mut raffle, RaffleStatus::Active, ts)?;
+
+    PrizeDeposited { creator: raffle.creator.clone(), amount: raffle.prize_amount, token: raffle.prize_token.clone(), timestamp: ts }.publish(&env);
 
     Ok(())
 }
