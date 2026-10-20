@@ -793,12 +793,13 @@ if config.randomness_source == RandomnessSource::External {
             }
 
             let aggregate = randomness::aggregate_quorum_seeds(&env, request_id, &seeds);
-            helpers::do_finalize_with_seed(&env, raffle, aggregate, RandomnessType::Quorum, Some(seeds))?;
+            let result = helpers::do_finalize_with_seed(&env, raffle, aggregate, RandomnessType::Quorum, Some(seeds));
+            #[cfg(any(test, feature = "testutils"))]
+            assert_solvent_after_success(&env, &result);
+            return result;
         }
 
-        #[cfg(any(test, feature = "testutils"))]
-        assert_solvent_after_success(&env, &result);
-        result
+        Ok(())
     }
 
     /// Open a ticket-holder commit made while the raffle was `Active` for the
