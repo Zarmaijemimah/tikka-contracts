@@ -15,7 +15,7 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = []
 std = []
-testutils = ["soroban-sdk/testutils"]
+testutils = ["soroban-sdk/testutils", "raffle-shared/testutils"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
@@ -24,4 +24,5 @@ raffle-shared = { path = "../raffle-shared" }
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 ed25519-dalek = { version = "=2.1.1", features = ["rand_core"] }
+proptest = "1"
 

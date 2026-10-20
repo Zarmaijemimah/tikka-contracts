@@ -13,42 +13,43 @@ Symptom → cause → fix for the setup problems that show up repeatedly in PRs 
 ```text
 error[E0463]: can't find crate for `core`
   |
-  = note: the `wasm32-unknown-unknown` target may not be installed
+  = note: the `wasm32v1-none` target may not be installed
 ```
 
-**Cause:** Rust WASM target missing.
+**Cause:** The pinned WASM target is not installed.
 
-**Fix:**
+**Fix:** `rust-toolchain.toml` declares both the compiler version and the target,
+so rustup can install everything for you:
 
 ```bash
-rustup target add wasm32-unknown-unknown
-# If using newer stellar-cli / sdk builds that emit wasm32v1-none:
-rustup target add wasm32v1-none
+rustup show
 ```
 
 ---
 
-## 2. `Error: WASM file not found at target/wasm32v1-none/release/raffle-factory.wasm`
+## 2. `Error: expected artifact not found at target/wasm32v1-none/release/raffle_factory.wasm`
 
-**Symptom:** `scripts/deploy-testnet.sh`, `deploy-mainnet.sh`, or `verify.sh` exits after build with that path missing.
+**Symptom:** `scripts/deploy-testnet.sh`, `deploy-mainnet.sh`, `smoke-test.sh` or
+`verify.sh` exits after the build with that path missing.
 
-**Cause:** Scripts expect the **`wasm32v1-none`** output layout from `stellar contract build`, while CI/`DEVELOPMENT.md` often build with `--target wasm32-unknown-unknown` (different directory).
+**Cause:** The build did not go through `stellar contract build`, so the
+artifacts landed under a different target directory.
 
-**Fix (pick one):**
+**Fix:** Build the way every other path in the repository does.
 
 ```bash
-# A) Use Stellar CLI build (matches scripts)
-stellar contract build
+make build          # → stellar contract build
 ls target/wasm32v1-none/release/*.wasm
-
-# B) Or build the CI target and symlink/copy into the path the script expects
-cargo build --target wasm32-unknown-unknown --release -p raffle-factory
-mkdir -p target/wasm32v1-none/release
-cp target/wasm32-unknown-unknown/release/raffle_factory.wasm \
-   target/wasm32v1-none/release/raffle-factory.wasm
 ```
 
-Confirm the exact `.wasm` filename (`raffle-factory.wasm` vs `raffle_factory.wasm`) after your build — Cargo may emit underscores.
+There is exactly one build target, `wasm32v1-none`, and one set of artifact
+paths. Both are defined in `scripts/common.sh` and sourced by the Makefile
+targets, the deploy scripts, `verify.sh` and CI, so they cannot drift apart.
+Do not copy artifacts between target directories to satisfy a script — that
+hides a real mismatch between what you tested and what you deploy.
+
+Artifact names use underscores (`raffle_factory.wasm`, `raffle_instance.wasm`),
+matching Cargo's crate-name normalisation.
 
 ---
 
@@ -119,20 +120,22 @@ Use `nvm install 20 && nvm use 20` (or equivalent) if your default Node is 18/22
 
 ---
 
-## 6. `Error: DEPLOYER_SECRET_KEY is required to deploy`
+## 6. `Error: DEPLOYER_SECRET_KEY is required to configure the deployer identity`
 
-**Symptom:** Deploy scripts exit immediately with that message.
+**Symptom:** A deploy or invoke script cannot find a local `deployer` identity.
 
-**Cause:** `.env` missing, not loaded, or key commented out. Scripts only auto-load `.env` from the **repo root**.
+**Cause:** The Stellar CLI identity is not configured and `DEPLOYER_SECRET_KEY` is missing. Scripts only auto-load `.env` from the **repo root**.
 
 **Fix:**
 
 ```bash
 cp .env.example .env
-# Uncomment and set:
-# DEPLOYER_SECRET_KEY="S..."
+# Set DEPLOYER_SECRET_KEY in the untracked .env file, then run:
 ./scripts/deploy-testnet.sh   # run from repo root
 ```
+
+The key is consumed once from stdin to configure the local Stellar CLI identity;
+it is never included in a Stellar command argument.
 
 ---
 
@@ -191,7 +194,7 @@ or docs/scripts still say `-p raffle` / `raffle.wasm`.
 cargo test -p raffle-factory
 cargo test -p raffle-instance
 cargo test -p raffle-shared
-cargo build --release --target wasm32-unknown-unknown -p raffle-factory -p raffle-instance
+stellar contract build   # builds every contract for wasm32v1-none
 ```
 
 See [CONTRIBUTING.md](../CONTRIBUTING.md).
@@ -215,8 +218,36 @@ Re-commit before pushing.
 
 ---
 
+## 11. Who gets the refund for a gifted ticket?
+
+**Policy:** If a raffle is cancelled or fails, the refund for any tickets goes to the **payer** (the one who bought the ticket), not the ticket owner/recipient.
+
+**Why?** The gifter paid the funds, so on cancellation, the funds are returned to the source. The recipient did not pay, so they do not receive a refund. Either party (payer or owner) can initiate the refund, but the contract always directs the funds to the original payer.
+
+---
+
+## 12. Who can call `finalize_raffle`, and when?
+
+**Policy:** **Anyone.** `finalize_raffle` is permissionless and does not require creator authorization.
+
+**When?** Only once the raffle is contractually over, which the contract checks on chain:
+
+- `time_ended` — `ledger_timestamp >= end_time` (not applied when `no_deadline` is `true`), or
+- `tickets_full` — `tickets_sold >= max_tickets`.
+
+Calling it before either condition holds reverts with `InvalidStateTransition`; calling it again
+after the draw has moved on reverts with `InvalidStatus`.
+
+**Why not creator-only?** The preconditions are fully verifiable on chain, so there was no reason
+to gate the call on the creator's signature. Requiring it let a creator who disliked the
+participant set simply never call it, leaving buyers' funds escrowed indefinitely. `refund_ticket`
+was no escape either, because it only applies to a `Cancelled` or `Failed` raffle — admin
+cancellation was the only remaining exit. See [#1000].
+
+---
+
 ## Still stuck?
 
-1. Read [DEVELOPMENT.md](../DEVELOPMENT.md) and [DEPLOYMENT.md](DEPLOYMENT.md).  
+1. Read [DEVELOPMENT.md](DEVELOPMENT.md) and [DEPLOYMENT.md](DEPLOYMENT.md).
 1. Search existing issues/PRs for the error string.  
 1. Open a new issue with: OS, `rustc -V`, `stellar --version`, `node -V`, and the full command + log.

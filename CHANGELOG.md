@@ -12,14 +12,27 @@ Versioning: [Semantic Versioning](https://semver.org/)
 - Architecture documentation with factory -> instance -> oracle flow and state-machine diagrams (`docs/ARCHITECTURE.md`).
 - Comprehensive rustdoc comments for all public `raffle-shared` enums, structs, fields, constants, and functions.
 - Pull request template requiring changelog updates for non-trivial changes.
+- `OracleSeedDelivered` event documenting per-oracle quorum seed submissions; `OracleNotRegistered` and `DuplicateOracleSubmission` error codes (#856).
+- Deterministic event-doc generator (`scripts/generate_event_docs.py`) with a CI sync check for `docs/EVENTS.md` (#856).
+- Rust line-coverage ratchet (`scripts/check_coverage_ratchet.py`) with `coverage/coverage-ratchet.json` baseline, a `coverage` CI job, and oracle coverage artifact upload (#830).
+- Supply-chain guard (`scripts/check_supply_chain.py`, `make supply-chain`) with a `Supply Chain Guard` workflow running on every push and pull request: fails CI on editor auto-run tasks, install-time npm lifecycle scripts, dependencies that gain an install script, tracked font or binary payloads, and symlinks escaping the repository.
 
 ### Changed
 
 - README documentation section now links to architecture docs.
+- `Error::ExceedsMaxTicketsPerAddress` renumbered from `65` to `67` (was colliding with `CancelTimelockActive`); `OracleNotRegistered` (`68`) and `DuplicateOracleSubmission` (`69`) added (#605, #856).
+- `WinnerDrawn.ticket_id` now publishes the 1-based ticket ID (`index + 1`) instead of the 0-based pool position; `docs/EVENTS.md` documents the index-vs-ID convention (#856).
+- `TicketPurchased.effective_ticket_price` is now populated (was an undefined variable that broke the build); `TicketGifted` sets it consistently (#856).
+- `ContractPaused` / `ContractUnpaused` event structs defined once in `raffle-shared` and re-exported, removing the duplicate E0252 definitions in the factory and instance crates (#856).
+- `.github/CODEOWNERS` now uses real maintainer usernames instead of the nonexistent `@maintainers` team (#848).
+- `generate_error_docs.py` regenerates the whole `docs/ERRORS.md` deterministically from both the instance and factory error enums (#856).
+- `.github/CODEOWNERS` rewritten as a single rule set and extended to the paths that execute on clone, open, install or build (`.vscode/`, `.devcontainer/`, hook config, dependency manifests and lockfiles, Dockerfiles, binary and font extensions). A duplicated second half assigning every path to the nonexistent `@crackedstudio/maintainers` team was removed: CODEOWNERS resolves last-match-wins rather than accumulating, so those lines overrode the valid rules above them and, being an invalid owner, assigned no reviewer at all — reintroducing the fault fixed in #848.
+- `.vscode/settings.json` pins `task.allowAutomaticTasks` to `"off"` rather than relying on the editor default.
 
 ### Documented
 
 - Standardized event emission model and event catalog (`docs/EVENTS.md`).
+- All `#[contractevent]` structs and fields now carry `///` doc comments with explicit index-vs-ID semantics; `max_tickets_per_address` doc entries in `init.rs` and `tickets.rs` updated to reflect that the cap is now validated and enforced (#605, #856).
 - Lifecycle/admin event coverage and event publishing patterns from the previous implementation summary.
 - Admin key migration was recorded as a historical note (source file existed but contained no additional details).
 #### Factory contract
@@ -128,7 +141,7 @@ Versioning: [Semantic Versioning](https://semver.org/)
 - `DrawingLock` reentrancy guard is now a separate `DataKey::DrawingLock` instance-storage flag rather than inline logic.
 - Commit-reveal entries keyed by ticket ID (`DataKey::CommitEntry(u32)`) instead of owner address so commits survive ticket transfers (#311).
 - `PrngWinnerSelection` and `OracleSeedWinnerSelection` extracted as implementations of the `WinnerSelectionStrategy` trait (#537).
-- `build_internal_seed` mixes five entropy sources: ledger timestamp, ledger sequence, network ID, raffle contract address (XDR), and tickets sold.
+- Internal PRNG seed construction uses four base inputs in `build_internal_seed`; `PrngWinnerSelection` adds tickets sold in a second hash.
 - `require_valid_role_address` uses an XDR-based zero-contract check (WASM-compatible) instead of `address.exists()` (#520).
 - `.gitignore` updated to exclude `target/`, `*.wasm`, `Cargo.lock`, `oracle/node_modules/`, `oracle/dist/`, `.stellar/`, `.soroban/`, `deployments/mainnet.json`, `.env`, `.DS_Store` (#499, #544).
 - `Cargo.toml` files for all crates now include `license`, `description`, `repository`, `authors`, `keywords`, and `categories` metadata (#493, #525).

@@ -1,37 +1,100 @@
 # CODEOWNERS file for Tikka
-# This file defines who should be automatically requested for review
-# based on the files changed in a pull request.
+# This file defines who is automatically requested for review based on the
+# files changed in a pull request.
 #
 # Format: <file-pattern> <owner> [<owner> ...]
-# Owners can be GitHub usernames (@username) or teams (@org/team-name)
+# Owners can be GitHub usernames (@username) or teams (@org/team-name).
 #
 # Reference: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+#
+# TWO RULES THAT ARE EASY TO GET WRONG, AND HAVE BEEN GOT WRONG HERE BEFORE:
+#
+#   1. The LAST matching pattern wins — it does not accumulate. A later `*`
+#      line silently replaces every owner assigned above it. Keep the broad
+#      patterns at the top and the narrow ones at the bottom, and never repeat
+#      a pattern.
+#   2. An owner that does not exist, or that lacks write access, makes the
+#      whole line invalid and assigns NO reviewer. GitHub reports this under
+#      Settings -> Branches, and the file previously named a `@maintainers`
+#      team that the org never had, so nothing was ever assigned. Before
+#      adding a team here, confirm it exists in the `crackedstudio` org and
+#      has write access to this repository.
+#
+# CODEOWNERS only requests review. It is enforced only once branch protection
+# on `master` has "Require review from Code Owners" enabled — see SECURITY.md.
 
-# Global fallback - all files
-* @maintainers
+# ---------------------------------------------------------------------------
+# Global fallback — every file
+# ---------------------------------------------------------------------------
+* @Otaiki1
 
-# Smart contracts (Rust)
-contracts/** @maintainers
+# ---------------------------------------------------------------------------
+# Source
+# ---------------------------------------------------------------------------
+contracts/** @Otaiki1 @king-aj-the-first
+oracle/** @Otaiki1 @king-aj-the-first
+docs/** @Otaiki1 @king-aj-the-first
+*.md @Otaiki1
 
-# Oracle service (TypeScript/Node.js)
-oracle/** @maintainers
+# ---------------------------------------------------------------------------
+# Build, CI and deployment
+# ---------------------------------------------------------------------------
+.github/** @Otaiki1
+.github/workflows/** @Otaiki1
+scripts/** @Otaiki1
+Makefile @Otaiki1
 
-# GitHub configuration (workflows, templates, etc.)
-.github/** @maintainers
+# ---------------------------------------------------------------------------
+# Supply-chain surface — code that runs on clone, open, install or build.
+#
+# These paths execute on a contributor's machine without them running
+# anything deliberately, which is how the 2026 auto-task malware campaign
+# spread through merged pull requests. Changes here need a maintainer's eyes
+# even when the diff looks cosmetic.
+# ---------------------------------------------------------------------------
 
-# Documentation
-docs/** @maintainers
-*.md @maintainers
+# Editor configuration: tasks can be set to run on folder open, and settings
+# can re-enable that behaviour.
+.vscode/** @Otaiki1
+.devcontainer/** @Otaiki1
+.editorconfig @Otaiki1
 
-# Deployment scripts
-scripts/** @maintainers
+# Git and pre-commit hooks run on ordinary git commands.
+.pre-commit-config.yaml @Otaiki1
+.githooks/** @Otaiki1
 
-# CI/CD configuration
-.github/workflows/** @maintainers
+# Dependency manifests and lockfiles: npm lifecycle scripts and Cargo build
+# scripts both execute at install time.
+Cargo.toml @Otaiki1
+Cargo.lock @Otaiki1
+deny.toml @Otaiki1
+rust-toolchain.toml @Otaiki1
+.cargo/** @Otaiki1
+package.json @Otaiki1
+package-lock.json @Otaiki1
+oracle/package.json @Otaiki1
+oracle/package-lock.json @Otaiki1
+pyproject.toml @Otaiki1
 
-# Root configuration files
-Cargo.toml @maintainers
-Cargo.lock @maintainers
-package.json @maintainers
-package-lock.json @maintainers
-.env.example @maintainers
+# Container and compose definitions.
+oracle/Dockerfile @Otaiki1
+.devcontainer/Dockerfile @Otaiki1
+docker-compose.yml @Otaiki1
+
+# Environment templates — a changed example teaches contributors the wrong
+# values and can redirect secrets.
+.env.example @Otaiki1
+
+# Binary and font files. This repo tracks neither; the campaign's dropper
+# shipped as a webfont. Any addition matching these is reviewed by a human.
+*.woff @Otaiki1
+*.woff2 @Otaiki1
+*.eot @Otaiki1
+*.ttf @Otaiki1
+*.otf @Otaiki1
+*.llf @Otaiki1
+*.wasm @Otaiki1
+*.exe @Otaiki1
+*.dll @Otaiki1
+*.so @Otaiki1
+*.dylib @Otaiki1

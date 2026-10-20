@@ -5,6 +5,13 @@ on:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -12,35 +19,69 @@ jobs:
   test:
     name: Run Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up pinned Rust toolchain
+        uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
       - name: Run Tests
         run: cargo test --workspace
 
   release:
     name: Build and Release
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: test
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up pinned Rust toolchain
+        uses: ./.github/actions/setup-rust
+      - name: Set up Stellar CLI
+        uses: ./.github/actions/setup-stellar-cli
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+
+      # Builds through the same path as the deploy scripts, so the artifacts
+      # attached here are the ones that get deployed (issue #841).
       - name: Build release WASMs
-        run: cargo build --target wasm32-unknown-unknown --release
+        run: ./scripts/build-reproducible.sh | tee build-output.txt
+
+      # Publishing the hashes is what makes "the contract is open source" a
+      # checkable claim rather than an assertion (issue #843).
+      - name: Generate checksums and build provenance
+        run: |
+          source scripts/common.sh
+          ( cd "${WASM_DIR}" && sha256sum ./*.wasm ) > SHA256SUMS.txt
+          {
+            echo "## Reproducing this build"
+            echo
+            echo '```'
+            echo "git checkout ${GITHUB_REF_NAME}"
+            echo "./scripts/build-reproducible.sh"
+            echo '```'
+            echo
+            echo "Rust toolchain: $(rust_toolchain_channel) (rust-toolchain.toml)"
+            echo "Stellar CLI:    ${STELLAR_CLI_VERSION}"
+            echo "WASM target:    ${WASM_TARGET}"
+            echo "Commit:         ${GITHUB_SHA}"
+            echo
+            echo '### SHA-256'
+            echo
+            echo '```'
+            cat SHA256SUMS.txt
+            echo '```'
+            echo
+            cat CHANGELOG.md
+          } > RELEASE_NOTES.md
+          cp "${WASM_DIR}"/*.wasm .
+
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           files: |
-            target/wasm32-unknown-unknown/release/raffle.wasm
-            target/wasm32-unknown-unknown/release/raffle_instance.wasm
-          body_path: CHANGELOG.md
+            ./*.wasm
+            SHA256SUMS.txt
+          body_path: RELEASE_NOTES.md
           draft: false

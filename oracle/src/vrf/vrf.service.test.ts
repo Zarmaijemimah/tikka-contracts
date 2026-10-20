@@ -1,7 +1,7 @@
 import { Keypair } from '@stellar/stellar-sdk';
-import { KeyService } from '../keys/key.service';
+import { EnvSecretsAdapter, KeyService } from '../keys/key.service';
 import { VrfService } from './vrf.service';
-import { buildVrfProofMessage } from './proof-message';
+import { buildVrfProofMessage, deriveRandomSeedFromProof } from './proof-message';
 
 describe('buildVrfProofMessage', () => {
   it('produces distinct messages for different raffle contracts', () => {
@@ -10,13 +10,11 @@ describe('buildVrfProofMessage', () => {
 
     const messageA = buildVrfProofMessage(
       'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4',
-      requestId,
-      seed,
+      requestId
     );
     const messageB = buildVrfProofMessage(
       'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM',
-      requestId,
-      seed,
+      requestId
     );
 
     expect(messageA.equals(messageB)).toBe(false);
@@ -27,26 +25,26 @@ describe('VrfService', () => {
   const keypair = Keypair.random();
 
   beforeEach(() => {
-    process.env.ORACLE_SECRET_KEY = keypair.secret();
+    process.env['ORACLE_SECRET_KEY'] = keypair.secret();
   });
 
   afterEach(() => {
-    delete process.env.ORACLE_SECRET_KEY;
+    delete process.env['ORACLE_SECRET_KEY'];
   });
 
   it('signs and verifies a context-bound randomness proof', async () => {
-    const keyService = new KeyService();
+    const keyService = new KeyService(new EnvSecretsAdapter(process.env));
     await keyService.initialize();
 
     const vrf = new VrfService(keyService);
     const raffleContract = 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4';
     const requestId = 7n;
-    const randomSeed = 123456789n;
 
-    const signed = vrf.signRandomnessProof(raffleContract, requestId, randomSeed);
-    const message = buildVrfProofMessage(raffleContract, requestId, randomSeed);
+    const signed = vrf.signRandomnessProof(raffleContract, requestId);
+    const message = buildVrfProofMessage(raffleContract, requestId);
 
     expect(signed.publicKey).toEqual(keyService.getPublicKeyBytes());
     expect(keypair.verify(message, Buffer.from(signed.proof))).toBe(true);
+    expect(signed.randomSeed).toBe(deriveRandomSeedFromProof(signed.proof));
   });
 });
